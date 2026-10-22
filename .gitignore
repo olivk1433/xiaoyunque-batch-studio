@@ -1,0 +1,34 @@
+# Local credentials: examples are the only publishable key files.
+API密钥.txt
+**/API密钥.txt
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.pfx
+*.p12
+.npmrc
+.netrc
+
+# Personal projects, source materials, videos, databases and logs.
+runtime/
+outputs/
+reports/
+data/
+素材/
+**/*.sqlite
+**/*.sqlite-*
+**/*.db
+**/*.log
+**/.tmp/
+.tmp/
+node_modules/
+dist/
+bin/
+*.zip
+*.exe
+*.dll
+Thumbs.db
+.DS_Store
+desktop.ini

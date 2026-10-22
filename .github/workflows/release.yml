@@ -1,0 +1,52 @@
+name: Windows portable release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+      - name: Check release tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $version = (Get-Content package.json | ConvertFrom-Json).version
+          if ($env:RELEASE_TAG -ne "v$version") { throw 'Tag and package version differ' }
+      - run: npm test
+      - run: npm run audit:privacy
+      - name: Fetch official runtime
+        id: runtime
+        shell: pwsh
+        run: ./scripts/fetch-runtime.ps1
+      - name: Build portable package
+        shell: pwsh
+        env:
+          RUNTIME_DIRECTORY: ${{ steps.runtime.outputs.runtime_directory }}
+        run: node scripts/build-portable.mjs --runtime-dir "$env:RUNTIME_DIRECTORY"
+      - name: Archive and publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "xiaoyunque-batch-studio-$env:RELEASE_TAG-windows-x64"
+          $archive = "dist/$name.zip"
+          Compress-Archive -LiteralPath "dist/$name" -DestinationPath $archive
+          $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  $name.zip" | Set-Content -LiteralPath 'dist/SHA256SUMS.txt' -Encoding utf8
+          gh release create "$env:RELEASE_TAG" "$archive" 'dist/SHA256SUMS.txt' --repo "$env:REPOSITORY" --verify-tag --title "$env:RELEASE_TAG" --notes-file docs/RELEASE_NOTES.md
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub Release publication failed' }
