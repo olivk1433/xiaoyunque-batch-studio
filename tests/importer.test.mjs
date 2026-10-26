@@ -23,15 +23,32 @@ test('同一个角色文件在不同镜头里保留各自编号，音频独立�
   assert.equal(first.bindings.find(item => item.kind === 'audio').index, 1);
 });
 
-test('缺号、重复槽、未编号素材都阻止自动提交', () => {
+test('缺号、同名编号和未编号素材按文件顺序连续绑定', () => {
   const result = bindReferences([file('图片2_场景.png'), file('图片2_人物.png'), file('随意文件.png')], '@图片1 @图片2');
-  const codes = result.issues.filter(item => item.level === 'error').map(item => item.code);
-  for (const code of ['MISSING_REFERENCE', 'DUPLICATE_SLOT', 'UNASSIGNED_MEDIA', 'SLOT_GAP']) assert.ok(codes.includes(code));
+  assert.deepEqual(result.bindings.map(item => item.index), [1, 2, 3]);
+  assert.equal(result.issues.filter(item => item.level === 'error').length, 0);
 });
 
-test('没有提示词中的九宫格对应说明时，不猜图片1', () => {
+test('无编号文件也按自然顺序导入', () => {
   const result = bindReferences([file('九宫格实景分镜.png')], '@图片1：人物');
-  assert.equal(result.bindings.length, 0);
+  assert.equal(result.bindings.length, 1);
+  assert.equal(result.bindings[0].label, '@图片1');
+  assert.equal(result.issues.length, 0);
+});
+
+test('序号前缀、无分隔文字与音频缺号可识别，各类型独立从 1 编号', () => {
+  const result = bindReferences([
+    file('10_图片1.png'), file('02_图片2角色.png'), file('01_图片1.png'),
+    file('音频4.mp3', 'audio'), file('音频2.mp3', 'audio'), file('音频3角色.wav', 'audio'),
+    file('视频9.mp4', 'video'),
+  ], '@图片1 @图片2 @图片3 @音频1 @音频2 @音频3 @视频1');
+  assert.deepEqual(result.bindings.filter(item => item.kind === 'image').map(item => item.name), ['01_图片1.png', '02_图片2角色.png', '10_图片1.png']);
+  assert.deepEqual(result.bindings.filter(item => item.kind === 'audio').map(item => [item.name, item.label]), [['音频2.mp3', '@音频1'], ['音频3角色.wav', '@音频2'], ['音频4.mp3', '@音频3']]);
+  assert.equal(result.issues.length, 0);
+});
+
+test('放宽文件名后，提示词指向实际不存在的素材仍会报错', () => {
+  const result = bindReferences([file('01_图片1.png')], '@图片1 @图片2');
   assert.ok(result.issues.some(item => item.code === 'MISSING_REFERENCE'));
 });
 

@@ -5,11 +5,14 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { randomUUID, randomBytes, timingSafeEqual } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { inspectEpisode } from './lib/importer.mjs';
+import { inspectEpisode, bindReferences } from './lib/importer.mjs';
 import { Store, importProject, publicProject } from './lib/store.mjs';
 import { Queue, keyIdentity } from './lib/queue.mjs';
 import { createKeyConfig } from './lib/key-config.mjs';
 import { MODELS, RATIOS, RESOLUTIONS, IN_FLIGHT, sanitizeName } from './lib/catalog.mjs';
+import { safeMediaPath, saveManagedMedia, MEDIA_LIMITS } from './lib/materials.mjs';
+import { presetParameters } from './lib/presets.mjs';
+import { referenceChange, numberReferences } from './public/reference-links.js';
 
 const projectRoot = fileURLToPath(new URL('.', import.meta.url));
 export const DEFAULT_SAMPLE = path.join(projectRoot, 'examples');
@@ -67,7 +70,8 @@ export async function createStudio({ dataRoot = path.join(projectRoot, 'runtime'
   const keyConfig = createKeyConfig({ filePath: keyFile, fallbackKey: key === undefined ? process.env.XIAOYUNQUE_API_KEY || '' : key });
   const session = { get key() { return keyConfig.getKey(); }, set key(value) { keyConfig.setTemporary(value); } };
   const csrf = randomBytes(32).toString('hex');
-  const queue = new Queue(store, outputRoot, { getKey: () => session.key, ...(providerFactory ? { providerFactory } : {}) });
+  const managedRoot = path.resolve(dataRoot, 'media');
+  const queue = new Queue(store, outputRoot, { managedRoot, getKey: () => session.key, ...(providerFactory ? { providerFactory } : {}) });
   let ready = false;
   let importBusy = false;
 
@@ -80,8 +84,28 @@ export async function createStudio({ dataRoot = path.join(projectRoot, 'runtime'
     return {
       projects: store.projects().map(project => publicProject(project, attempts)), attempts: publicAttempts,
       settings: { ...store.settings(), hasKey: Boolean(session.key), keyConfig: keyConfig.status(), outputRoot },
-      catalog: { models: MODELS, ratios: RATIOS, resolutions: RESOLUTIONS },
+      catalog: { models: MODELS, ratios: RATIOS, resolutions: RESOLUTIONS, mediaLimits: MEDIA_LIMITS }, presets: store.presets(),
     };
+  }
+
+  function reviewReferences(shot, before, options = {}) {
+    let baseline = shot.referenceReview?.before || before;
+    if (options.referenceBaseline !== undefined) {
+      if (!Array.isArray(options.referenceBaseline) || new Set(options.referenceBaseline).size !== options.referenceBaseline.length) throw new Error('引用核对基线不合法');
+      baseline = numberReferences(options.referenceBaseline.map(id => {
+        const file = shot.mediaFiles.find(ref => ref.id === id);
+        if (!file) throw new Error('引用基线素材不属于本片段');
+        return file;
+      }));
+    }
+    const result = referenceChange(baseline, shot.references, shot.prompt);
+    shot.references = result.references;
+    if (options.syncReferences === true) {
+      if (!result.canSync) throw new Error('提示词仍引用已移除的素材，请先编辑提示词或恢复素材，再同步');
+      shot.prompt = result.syncedPrompt;
+      shot.referenceReview = null;
+    } else if (options.confirmReferences === true || !result.changed.length) shot.referenceReview = null;
+    else shot.referenceReview = { before: baseline.map(({ id, name, kind, index }) => ({ id, name, kind, index })), changed: result.changed, canSync: result.canSync };
   }
   async function importFolder(input) {
     if (importBusy) throw new Error('另一个目录正在导入，请稍后重试');
@@ -112,12 +136,85 @@ export async function createStudio({ dataRoot = path.join(projectRoot, 'runtime'
         if (!ready) { json(response, { error: '工作台正在启动，请稍后刷新' }, 503); return; }
         if (request.method !== 'GET' && request.method !== 'HEAD') {
           if (!equalToken(request.headers['x-csrf-token'], csrf) || (request.headers.origin && request.headers.origin !== `http://${host}`)) { json(response, { error: '请求校验失败，请刷新页面' }, 403); return; }
-          if (!request.headers['content-type']?.startsWith('application/json')) throw new Error('请使用 JSON 请求');
+          const mediaUpload = request.method === 'POST' && /^\/api\/projects\/[a-f0-9-]+\/shots\/[a-f0-9-]+\/media$/u.test(url.pathname);
+          if (!request.headers['content-type']?.startsWith(mediaUpload ? 'application/octet-stream' : 'application/json')) throw new Error(mediaUpload ? '请直接发送素材文件' : '请使用 JSON 请求');
         }
         if (url.pathname === '/api/state' && request.method === 'GET') { json(response, state()); return; }
+        const mediaUploadMatch = /^\/api\/projects\/([a-f0-9-]+)\/shots\/([a-f0-9-]+)\/media$/u.exec(url.pathname);
+        if (mediaUploadMatch && request.method === 'POST') {
+          const [ , projectId, shotId ] = mediaUploadMatch;
+          let project = store.project(projectId), shot = project?.shots.find(item => item.id === shotId);
+          if (!shot) throw new Error('项目或片段不存在');
+          const revision = Number(url.searchParams.get('revision'));
+          if (project.revision !== revision) throw new Error('项目已更新，请刷新后再添加素材');
+          const replaceId = url.searchParams.get('replace');
+          const staged = url.searchParams.get('stage') === '1';
+          const old = replaceId ? (staged ? shot.mediaFiles : shot.references).find(ref => ref.id === replaceId) : null;
+          if (replaceId && !old) throw new Error('待替换素材不存在');
+          const folder = path.join(managedRoot, projectId, shotId);
+          await fs.mkdir(managedRoot, { recursive: true });
+          await safeMediaPath(managedRoot, managedRoot);
+          for (const directory of [path.join(managedRoot, projectId), folder]) {
+            await fs.mkdir(directory, { recursive: true }); await safeMediaPath(managedRoot, directory);
+          }
+          const file = await saveManagedMedia(request, { root: folder, name: url.searchParams.get('name'), expectedKind: old?.kind });
+          try {
+            // The request can stream for minutes. Re-read after the write to prevent stale overwrites.
+            project = store.project(projectId); shot = project?.shots.find(item => item.id === shotId);
+            if (!shot || project.revision !== revision) throw new Error('上传期间项目发生变化，本文件未采用，请重新添加');
+            if (old) file.replacesIds = [...new Set([old.id, ...(old.replacesIds || [])])];
+            const before = shot.references;
+            shot.mediaFiles.push(file);
+            if (!staged) {
+              shot.references = old ? shot.references.map(ref => ref.id === old.id ? file : ref) : [...shot.references, file];
+              reviewReferences(shot, before);
+            }
+            project.revision++; store.saveProject(project);
+            json(response, { fileId: file.id, state: state() }); return;
+          } catch (error) { await fs.unlink(file.absolutePath).catch(() => {}); throw error; }
+        }
+        if (url.pathname === '/api/presets' && request.method === 'POST') {
+          const input = await bodyOf(request);
+          const name = String(input.name || '').trim().slice(0, 80);
+          if (!name) throw new Error('请填写模板名称');
+          const parameters = presetParameters(input.parameters || {});
+          if (input.id && !store.presets().some(preset => preset.id === input.id)) throw new Error('模板不存在');
+          if (store.presets().some(preset => preset.name === name && preset.id !== input.id)) throw new Error('已有同名模板，请换一个名称');
+          store.savePreset({ id: input.id || randomUUID(), name, parameters });
+          json(response, state()); return;
+        }
+        const presetMatch = /^\/api\/presets\/([a-f0-9-]+)(\/apply)?$/u.exec(url.pathname);
+        if (presetMatch && request.method === 'DELETE' && !presetMatch[2]) {
+          store.deletePreset(presetMatch[1]); json(response, state()); return;
+        }
+        if (presetMatch?.[2] && request.method === 'POST') {
+          const input = await bodyOf(request), preset = store.presets().find(item => item.id === presetMatch[1]);
+          const project = store.project(input.projectId);
+          if (!preset || !project) throw new Error('模板或项目不存在');
+          if (project.revision !== input.revision) throw new Error('项目已更新，请刷新后再应用模板');
+          if (!Array.isArray(input.shotIds) || !input.shotIds.length || new Set(input.shotIds).size !== input.shotIds.length) throw new Error('请选择片段');
+          const parameters = presetParameters(preset.parameters);
+          for (const id of input.shotIds) {
+            const shot = project.shots.find(item => item.id === id);
+            if (!shot) throw new Error('片段不存在');
+            for (const field of ['model', 'resolution', 'ratio']) shot.parameters[field] = parameters[field];
+            if (parameters.durationSeconds !== null) shot.parameters.durationSeconds = parameters.durationSeconds;
+          }
+          project.revision++;
+          store.transaction(() => {
+            store.saveProject(project); store.saveSettings({ ...store.settings(), concurrency: parameters.concurrency });
+          });
+          json(response, state()); return;
+        }
         if (url.pathname === '/api/import' && request.method === 'POST') {
           const project = await importFolder(await bodyOf(request));
           json(response, { projectId: project.id, state: state() }); return;
+        }
+        if (url.pathname === '/api/material-order' && request.method === 'POST') {
+          const input = await bodyOf(request);
+          const shot = store.project(input.projectId)?.shots.find(item => item.id === input.shotId);
+          if (!shot) throw new Error('片段不存在');
+          json(response, { references: bindReferences(shot.mediaFiles, shot.prompt).bindings }); return;
         }
         if (url.pathname === '/api/settings' && request.method === 'POST') {
           const input = await bodyOf(request);
@@ -137,6 +234,11 @@ export async function createStudio({ dataRoot = path.join(projectRoot, 'runtime'
           json(response, state()); return;
         }
         const projectMatch = /^\/api\/projects\/([a-f0-9-]+)$/u.exec(url.pathname);
+        if (projectMatch && request.method === 'DELETE') {
+          const input = await bodyOf(request);
+          queue.deleteProject(projectMatch[1], input.revision);
+          json(response, state()); return;
+        }
         if (projectMatch && request.method === 'PATCH') {
           const input = await bodyOf(request);
           const project = store.project(projectMatch[1]);
@@ -147,6 +249,7 @@ export async function createStudio({ dataRoot = path.join(projectRoot, 'runtime'
           for (const patch of input.shots || []) {
             const shot = project.shots.find(item => item.id === patch.id);
             if (!shot) throw new Error('片段不存在');
+            const beforeReferences = shot.references;
             if (patch.prompt !== undefined) {
               shot.prompt = String(patch.prompt);
               if (shot.prompt.length > 50000) throw new Error('提示词超过 50000 字符');
@@ -170,6 +273,8 @@ export async function createStudio({ dataRoot = path.join(projectRoot, 'runtime'
                 return { ...file, index, label: `@${labels[file.kind]}${index}`, bindingRule: 'manual' };
               });
             }
+            if (patch.autoOrder === true) shot.references = bindReferences(shot.mediaFiles, shot.prompt).bindings;
+            reviewReferences(shot, beforeReferences, patch);
           }
           project.revision++; store.saveProject(project); json(response, state()); return;
         }
@@ -222,10 +327,11 @@ export async function createStudio({ dataRoot = path.join(projectRoot, 'runtime'
         if (url.pathname === '/api/media' && ['GET', 'HEAD'].includes(request.method)) {
           const project = store.project(url.searchParams.get('project'));
           const ref = project?.shots.flatMap(shot => shot.mediaFiles).find(file => file.id === url.searchParams.get('file'));
-          if (!ref || !inside(project.sourcePath, ref.absolutePath)) throw new Error('素材不存在');
+          const sourceRoot = ref?.storage === 'managed' ? managedRoot : project?.sourcePath;
+          if (!ref || !inside(sourceRoot, ref.absolutePath)) throw new Error('素材不存在');
           // Reject newly introduced links too, without relying on Windows realpath support.
-          let current = project.sourcePath;
-          for (const part of ['', ...path.relative(project.sourcePath, ref.absolutePath).split(path.sep)]) {
+          let current = sourceRoot;
+          for (const part of ['', ...path.relative(sourceRoot, ref.absolutePath).split(path.sep)]) {
             current = path.join(current, part);
             if ((await fs.lstat(current)).isSymbolicLink()) throw new Error('素材路径已改变，请重新导入');
           }
@@ -240,7 +346,7 @@ export async function createStudio({ dataRoot = path.join(projectRoot, 'runtime'
         json(response, { error: '接口不存在' }, 404); return;
       }
       if (!['GET', 'HEAD'].includes(request.method)) { json(response, { error: '请求方法不支持' }, 405); return; }
-      const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'] };
+      const assets = { '/': ['index.html', 'text/html; charset=utf-8'], '/app.js': ['app.js', 'text/javascript; charset=utf-8'], '/reference-links.js': ['reference-links.js', 'text/javascript; charset=utf-8'], '/styles.css': ['styles.css', 'text/css; charset=utf-8'] };
       const asset = assets[url.pathname];
       if (!asset) { response.writeHead(404); response.end('Not Found'); return; }
       let content = await fs.readFile(path.join(projectRoot, 'public', asset[0]), 'utf8');

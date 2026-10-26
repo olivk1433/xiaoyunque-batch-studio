@@ -1,6 +1,6 @@
 {
   "name": "xiaoyunque-batch-studio",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "private": true,
   "description": "非官方小云雀沉浸式短片批量工作台：本地素材编排、持久化队列与版本验收。",
   "license": "MIT",
